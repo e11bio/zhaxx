@@ -1,0 +1,9 @@
+Dataset mos [META], ID 0, cr_txg 4, 1.00G, 1000 objects
+
+    Object  lvl   iblk   dblk  dsize  dnsize  lsize   %full  type
+    34    1   128K    512    12K     512    512  100.00  DSL directory child map
+		$MOS = 35 
+		$FREE = 38 
+		$ORIGIN = 42 
+		data = 1792 
+		orphan-9f3c1d = 670 

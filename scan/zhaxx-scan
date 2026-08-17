@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: CDDL-1.0
+"""
+zhaxx-scan — read-only MOS referential-integrity scanner for ZFS pools.
+
+Walks the Meta Object Set (via `zdb` or a directory of saved zdb dumps) and
+cross-checks the DSL namespace for the corruption class that makes pools
+unimportable: unreadable objsets, dangling clone references, stale persistent
+error logs, and stale scan (scrub/resilver) cursors.
+
+Emits a human report and, with --plan, a repair plan for the zhaxx surgeon.
+Every plan operation carries the observed pre-state as a precondition; the
+surgeon re-verifies all preconditions atomically before modifying anything.
+
+Modes:
+  zhaxx-scan --pool NAME [--cachefile F] [--exported] [--capture DIR]
+      Run zdb live (read-only). --capture also saves every dump to DIR,
+      which doubles as the pre-surgery backup and as an offline dump set.
+  zhaxx-scan --dumps DIR
+      Offline: analyze dumps previously saved with --capture (obj_<N>.txt).
+
+Exit codes: 0 = clean, 1 = findings, 2 = usage/runtime error.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+# dsl_scan_phys_t scan-entry word count and state values (dsl_scan.h)
+SCAN_WORDS = 24
+DSS_SCANNING = 1
+SCAN_FUNC_NAMES = {0: "none", 1: "scrub", 2: "resilver"}
+SCAN_STATE_NAMES = {0: "none", 1: "SCANNING", 2: "finished", 3: "canceled"}
+
+MOS_DIR_OBJ = 1
+
+SEV_ORDER = {"CRITICAL": 0, "WARNING": 1, "INFO": 2}
+
+
+class Finding:
+    def __init__(self, severity, obj, message):
+        self.severity = severity
+        self.obj = obj
+        self.message = message
+
+    def as_dict(self):
+        return {"severity": self.severity, "object": self.obj,
+                "message": self.message}
+
+
+class ObjDump:
+    """Parsed zdb -dddd output for one MOS object."""
+
+    def __init__(self, obj):
+        self.obj = obj
+        self.exists = False        # dnode header found
+        self.unreadable = False    # header found but I/O errors reading it
+        self.type = None           # dnode type string as zdb prints it
+        self.bonus_type = None     # bonus type string, if any
+        self.fields = {}           # bonus fields: name -> int or str
+        self.zap = {}              # single-int ZAP entries: name -> int
+        self.zap_multi = {}        # multi-int ZAP entries: name -> [int, ...]
+        self.raw = ""
+
+    @property
+    def readable(self):
+        return self.exists and not self.unreadable
+
+
+OBJ_HEADER_RE = re.compile(
+    r"^\s+(\d+)\s+\d+\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+[\d.]+\s+(.+?)\s*$")
+BONUS_RE = re.compile(r"^\s+\d+\s+bonus\s+(.+?)\s*$")
+KV_RE = re.compile(r"^\t\t([^\s=][^=]*?)\s+=\s+(.*?)\s*$")
+ERROR_RE = re.compile(
+    r"i/o error|input/output error|errno\s*=?\s*5\b|EIO|failed to read"
+    r"|error reading|zdb: can't|dmu_bonus_hold\(\d+\) failed"
+    r"|dmu_object_info\(\)? failed", re.IGNORECASE)
+
+
+def parse_obj_dump(obj, text):
+    """Parse the zdb -dddd dump for a single object."""
+    d = ObjDump(obj)
+    d.raw = text
+    in_object = False
+    for line in text.splitlines():
+        m = OBJ_HEADER_RE.match(line)
+        if m and int(m.group(1)) == obj:
+            d.exists = True
+            in_object = True
+            d.type = m.group(2).split(" (K=")[0].strip()
+            continue
+        if not in_object:
+            if ERROR_RE.search(line):
+                d.unreadable = d.exists
+            continue
+        m = BONUS_RE.match(line)
+        if m:
+            d.bonus_type = m.group(1)
+            continue
+        if ERROR_RE.search(line):
+            d.unreadable = True
+            continue
+        m = KV_RE.match(line)
+        if m:
+            key, val = m.group(1), m.group(2)
+            words = val.split()
+            if len(words) > 1 and all(w.isdigit() for w in words):
+                d.zap_multi[key] = [int(w) for w in words]
+                continue
+            v = words[0] if words else ""
+            if re.fullmatch(r"\d+", v):
+                iv = int(v)
+                d.fields[key] = iv
+                d.zap[key] = iv
+            else:
+                d.fields[key] = val
+    return d
+
+
+class ZdbSource:
+    """Fetch object dumps by running zdb (read-only)."""
+
+    def __init__(self, pool, zdb="zdb", cachefile=None, exported=False,
+                 capture=None):
+        self.pool = pool
+        self.zdb = zdb
+        self.cachefile = cachefile
+        self.exported = exported
+        self.capture = capture
+        self.cache = {}
+        if capture:
+            os.makedirs(capture, exist_ok=True)
+
+    def get(self, obj):
+        if obj in self.cache:
+            return self.cache[obj]
+        cmd = [self.zdb]
+        if self.exported:
+            cmd.append("-e")
+        if self.cachefile:
+            cmd += ["-U", self.cachefile]
+        cmd += ["-dddd", self.pool, str(obj)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=120)
+            text = r.stdout + r.stderr
+        except subprocess.TimeoutExpired:
+            text = "zhaxx-scan: TIMEOUT running zdb"
+        except FileNotFoundError:
+            sys.exit(f"zhaxx-scan: zdb binary not found: {self.zdb}")
+        d = parse_obj_dump(obj, text)
+        self.cache[obj] = d
+        if self.capture:
+            with open(os.path.join(self.capture, f"obj_{obj}.txt"), "w") as f:
+                f.write(text)
+        return d
+
+
+class DumpDirSource:
+    """Fetch object dumps from a directory of obj_<N>.txt files."""
+
+    def __init__(self, dumpdir):
+        self.dir = dumpdir
+        self.cache = {}
+
+    def get(self, obj):
+        if obj in self.cache:
+            return self.cache[obj]
+        path = os.path.join(self.dir, f"obj_{obj}.txt")
+        if os.path.exists(path):
+            with open(path) as f:
+                d = parse_obj_dump(obj, f.read())
+        else:
+            # Absent dump file = object not captured; treat as missing but
+            # flag it so an incomplete capture is not mistaken for a free slot.
+            d = parse_obj_dump(obj, "")
+            d.raw = "(no dump file captured)"
+        self.cache[obj] = d
+        return d
+
+
+class PlanOp:
+    def __init__(self, line, comment):
+        self.line = line
+        self.comment = comment
+
+
+class Scanner:
+    def __init__(self, source, verbose=False):
+        self.src = source
+        self.findings = []
+        self.ops = []          # PlanOp list, ordered
+        self.visited_dirs = set()
+        self.verbose = verbose
+        self.num_children_fix = {}  # snapshot obj -> dangling clone count
+
+    # ---- helpers ----
+
+    def add(self, severity, obj, message):
+        self.findings.append(Finding(severity, obj, message))
+
+    def op(self, line, comment):
+        self.ops.append(PlanOp(line, comment))
+
+    def note(self, msg):
+        if self.verbose:
+            print(f"    . {msg}", file=sys.stderr)
+
+    # ---- checks ----
+
+    def check_errlog(self, mos):
+        errlog_last = mos.zap.get("errlog_last", 0)
+        errlog_scrub = mos.zap.get("errlog_scrub", 0)
+        for name, head_obj in (("errlog_last", errlog_last),
+                               ("errlog_scrub", errlog_scrub)):
+            if head_obj == 0:
+                continue
+            head = self.src.get(head_obj)
+            if not head.exists:
+                self.add("CRITICAL", MOS_DIR_OBJ,
+                         f"{name} = {head_obj} but that object does not exist "
+                         "(dangling error-log reference; import will attempt "
+                         "to process it)")
+                self.op(f"zap_set obj={MOS_DIR_OBJ} key={name} "
+                        f"expect={head_obj} value=0",
+                        f"clear dangling {name} reference")
+                continue
+            if "error log" not in (head.type or ""):
+                self.add("CRITICAL", head_obj,
+                         f"{name} = {head_obj} but object type is "
+                         f"'{head.type}', not a persistent error log — "
+                         "the ID was recycled; do NOT free it")
+                self.op(f"zap_set obj={MOS_DIR_OBJ} key={name} "
+                        f"expect={head_obj} value=0",
+                        f"detach {name} from recycled object (leave the "
+                        "object itself alone)")
+                continue
+            # errlog head maps objset-id (hex key) -> per-objset errlog obj
+            stale = []
+            for key, per_obj in head.zap.items():
+                try:
+                    objset = int(key, 16)
+                except ValueError:
+                    continue
+                ds = self.src.get(objset)
+                if not ds.readable:
+                    why = ("does not exist" if not ds.exists
+                           else "is unreadable (EIO)")
+                    stale.append((key, objset, per_obj, why))
+            if not stale:
+                self.add("INFO", head_obj,
+                         f"{name} = {head_obj}: entries present but all "
+                         "referenced objsets are readable (a normal error "
+                         "log; no action)")
+                continue
+            for key, objset, per_obj, why in stale:
+                self.add("CRITICAL", head_obj,
+                         f"{name} entry {key} references objset {objset} "
+                         f"which {why}; spa_errlog_sync will deadlock "
+                         "txg_sync processing it")
+            self.op(f"zap_set obj={MOS_DIR_OBJ} key={name} "
+                    f"expect={head_obj} value=0",
+                    f"break the {name} error-log chain")
+            self.op(f'free obj={head_obj} type="{head.type}"',
+                    f"free stale {name} head")
+            for key, objset, per_obj, why in stale:
+                per = self.src.get(per_obj)
+                if per.exists and "error log" in (per.type or ""):
+                    self.op(f'free obj={per_obj} type="{per.type}"',
+                            f"free per-objset error log for objset {objset}")
+                elif per.exists:
+                    self.add("WARNING", per_obj,
+                             f"per-objset errlog {per_obj} has type "
+                             f"'{per.type}' (recycled) — not freeing")
+
+    def check_scan(self, mos):
+        scan = mos.zap_multi.get("scan")
+        if scan is None:
+            if "scan" in mos.zap:  # single int - unexpected but handle
+                scan = [mos.zap["scan"]]
+            else:
+                return
+        func = scan[0] if len(scan) > 0 else 0
+        state = scan[1] if len(scan) > 1 else 0
+        queue_obj = scan[2] if len(scan) > 2 else 0
+        fname = SCAN_FUNC_NAMES.get(func, str(func))
+        sname = SCAN_STATE_NAMES.get(state, str(state))
+        if state != DSS_SCANNING:
+            self.note(f"scan entry: func={fname} state={sname} (inactive)")
+            return
+        problems = []
+        if queue_obj:
+            q = self.src.get(queue_obj)
+            if not q.readable:
+                problems.append(f"scan queue object {queue_obj} missing or "
+                                "unreadable")
+        # scn_bookmark objset (word 5 = scn_cur_min_txg.. layout varies by
+        # version; treat any dangling queue as the actionable signal)
+        if problems:
+            for p in problems:
+                self.add("CRITICAL", MOS_DIR_OBJ, f"in-progress {fname}: {p}")
+            self.add("CRITICAL", MOS_DIR_OBJ,
+                     f"stale in-progress scan cursor (func={fname}); on "
+                     "import the scan resumes and can VERIFY3-panic on "
+                     "freed objects")
+            self.op(f"zap_zero obj={MOS_DIR_OBJ} key=scan count={SCAN_WORDS}",
+                    "zero the stale scan cursor (a fresh scrub/resilver "
+                    "restarts from DTLs after import)")
+        else:
+            self.add("INFO", MOS_DIR_OBJ,
+                     f"scan in progress (func={fname}, state={sname}); "
+                     "queue readable — normal unless the pool also has "
+                     "freed-object findings. If surgery frees objects, "
+                     "re-run the scan check afterwards.")
+
+    def walk_dsl_dir(self, dir_obj, path):
+        if dir_obj in self.visited_dirs:
+            return
+        self.visited_dirs.add(dir_obj)
+        d = self.src.get(dir_obj)
+        if not d.readable:
+            self.add("CRITICAL", dir_obj,
+                     f"DSL directory {dir_obj} ({path}) missing or "
+                     "unreadable")
+            return
+        if "DSL directory" not in (d.type or ""):
+            self.add("CRITICAL", dir_obj,
+                     f"object {dir_obj} ({path}) expected DSL directory, "
+                     f"found '{d.type}' (recycled ID?)")
+            return
+        head = d.fields.get("head_dataset_obj", 0)
+        childmap = d.fields.get("child_dir_zapobj", 0)
+        clones = d.fields.get("clones", 0)
+        if head:
+            self.check_dataset(head, f"{path}@head", dir_obj)
+        if childmap:
+            self.check_childmap(childmap, dir_obj, path)
+        if clones:
+            self.check_clones_zap(clones, dir_obj, f"{path} dd_clones")
+
+    def check_childmap(self, zap_obj, dir_obj, path):
+        z = self.src.get(zap_obj)
+        if not z.readable:
+            self.add("CRITICAL", zap_obj,
+                     f"child map {zap_obj} of {path} missing or unreadable")
+            return
+        for name, child in sorted(z.zap.items()):
+            if name in ("$MOS", "$FREE", "$LEAKED"):
+                continue
+            c = self.src.get(child)
+            if not c.exists:
+                self.add("CRITICAL", zap_obj,
+                         f"child map entry '{name}' = {child} in {path} is "
+                         "dangling (directory object freed)")
+                self.op(f"zap_remove obj={zap_obj} key={name} expect={child}",
+                        f"drop dangling namespace entry '{name}'")
+                continue
+            if "DSL directory" not in (c.type or ""):
+                self.add("CRITICAL", zap_obj,
+                         f"child map entry '{name}' = {child} in {path} "
+                         f"points at type '{c.type}', not a DSL directory "
+                         "(recycled ID); remove the entry, do NOT free "
+                         "the object")
+                self.op(f"zap_remove obj={zap_obj} key={name} expect={child}",
+                        f"drop stale namespace entry '{name}' (recycled ID)")
+                continue
+            self.walk_dsl_dir(child, f"{path}/{name}")
+
+    def check_dataset(self, ds_obj, path, expect_dir=None):
+        ds = self.src.get(ds_obj)
+        if not ds.exists:
+            self.add("CRITICAL", ds_obj,
+                     f"dataset object {ds_obj} ({path}) does not exist")
+            return
+        if ds.unreadable:
+            self.add("CRITICAL", ds_obj,
+                     f"dataset {ds_obj} ({path}) is UNREADABLE (EIO) — this "
+                     "is the objset-corruption signature; any code path "
+                     "that opens it (errlog sync, clone enumeration, "
+                     "destroy) will fail or deadlock")
+            self.plan_orphan_removal(ds_obj, expect_dir, path)
+            return
+        if "DSL dataset" not in (ds.type or ""):
+            self.add("WARNING", ds_obj,
+                     f"dataset object {ds_obj} ({path}) has type "
+                     f"'{ds.type}', expected DSL dataset")
+            return
+        nco = ds.fields.get("next_clones_obj", 0)
+        if nco:
+            n_dangling = self.check_clones_zap(nco, ds_obj,
+                                               f"{path} next_clones")
+            nc = ds.fields.get("num_children")
+            if n_dangling and isinstance(nc, int):
+                self.num_children_fix[ds_obj] = (nc, n_dangling)
+                self.op(f"bonus_set obj={ds_obj} field=ds_num_children "
+                        f"expect={nc} value={nc - n_dangling}",
+                        f"account for {n_dangling} removed clone ref(s)")
+        prev = ds.fields.get("prev_snap_obj", 0)
+        if prev:
+            p = self.src.get(prev)
+            if not p.exists:
+                self.add("CRITICAL", ds_obj,
+                         f"{path}: prev_snap_obj = {prev} is dangling")
+        for f in ("deadlist_obj", "snapnames_zapobj"):
+            ref = ds.fields.get(f, 0)
+            if ref and not self.src.get(ref).exists:
+                self.add("WARNING", ds_obj,
+                         f"{path}: {f} = {ref} is dangling")
+
+    def check_clones_zap(self, zap_obj, owner, path):
+        """Check a clones ZAP (hex-key -> clone head dataset obj).
+        Returns the number of dangling entries (removals planned)."""
+        z = self.src.get(zap_obj)
+        if not z.readable:
+            self.add("CRITICAL", zap_obj,
+                     f"clones ZAP {zap_obj} ({path}) missing or unreadable")
+            return 0
+        dangling = 0
+        for key, clone_ds in sorted(z.zap.items()):
+            c = self.src.get(clone_ds)
+            if c.readable and "DSL dataset" in (c.type or ""):
+                continue
+            dangling += 1
+            if not c.exists:
+                why = "freed"
+            elif c.unreadable:
+                why = "unreadable (EIO)"
+            else:
+                why = f"recycled (type '{c.type}')"
+            self.add("CRITICAL", zap_obj,
+                     f"clones ZAP {zap_obj} ({path}) entry '{key}' -> "
+                     f"{clone_ds} is {why}; clone enumeration on import "
+                     "will fail on it")
+            self.op(f"zap_remove obj={zap_obj} key={key} expect={clone_ds}",
+                    f"drop {why} clone reference from {path}")
+        return dangling
+
+    def plan_orphan_removal(self, ds_obj, dir_obj, path):
+        """Dataset objset unreadable: plan removal of the whole orphan
+        (namespace entry, clone refs, and the DSL subtree objects)."""
+        if dir_obj is None:
+            return
+        d = self.src.get(dir_obj)
+        if not d.readable:
+            return
+        # namespace entry: find it in the parent's child map
+        parent = d.fields.get("parent_dir_obj", 0)
+        if parent:
+            p = self.src.get(parent)
+            pm = p.fields.get("child_dir_zapobj", 0) if p.readable else 0
+            if pm:
+                pmz = self.src.get(pm)
+                for name, val in pmz.zap.items():
+                    if val == dir_obj:
+                        self.op(f"zap_remove obj={pm} key={name} "
+                                f"expect={dir_obj}",
+                                f"remove orphan '{name}' from namespace")
+        # clone refs: origin snapshot's next_clones + origin dir's dd_clones
+        origin = d.fields.get("origin_obj", 0)
+        if origin:
+            o = self.src.get(origin)
+            if o.readable:
+                nco = o.fields.get("next_clones_obj", 0)
+                nc = o.fields.get("num_children")
+                if nco:
+                    oz = self.src.get(nco)
+                    for key, val in oz.zap.items():
+                        if val == ds_obj:
+                            self.op(f"zap_remove obj={nco} key={key} "
+                                    f"expect={ds_obj}",
+                                    "remove orphan from origin's "
+                                    "next_clones ZAP")
+                            if isinstance(nc, int):
+                                self.op(f"bonus_set obj={origin} "
+                                        f"field=ds_num_children "
+                                        f"expect={nc} value={nc - 1}",
+                                        "decrement origin snapshot child "
+                                        "count")
+                odir = o.fields.get("dir_obj", 0)
+                if odir:
+                    od = self.src.get(odir)
+                    ocl = od.fields.get("clones", 0) if od.readable else 0
+                    if ocl:
+                        oclz = self.src.get(ocl)
+                        for key, val in oclz.zap.items():
+                            if val == ds_obj:
+                                self.op(f"zap_remove obj={ocl} key={key} "
+                                        f"expect={ds_obj}",
+                                        "remove orphan from origin dir's "
+                                        "dd_clones ZAP")
+        # free the orphan subtree, types taken from observation
+        subtree = [dir_obj,
+                   d.fields.get("props_zapobj", 0),
+                   d.fields.get("child_dir_zapobj", 0),
+                   ds_obj]
+        ds = self.src.get(ds_obj)
+        for f in ("snapnames_zapobj", "deadlist_obj"):
+            subtree.append(ds.fields.get(f, 0))
+        for obj in subtree:
+            if not obj:
+                continue
+            o = self.src.get(obj)
+            if o.exists and o.unreadable:
+                # Freeing a dnode reads its block pointers; if the object is
+                # unreadable that fails, and the object type cannot be trusted
+                # anyway. Leave it allocated (a bounded, harmless leak) rather
+                # than risk freeing something whose type we cannot verify.
+                self.add("WARNING", obj,
+                         f"orphan structure {obj} is unreadable; leaving it "
+                         "allocated (harmless leak). All references to it are "
+                         "removed above, so no import path reaches it.")
+            elif o.exists and o.type:
+                self.op(f'free obj={obj} type="{o.type}"',
+                        f"free orphan structure ({o.type}) of {path}")
+            elif o.exists:
+                self.add("WARNING", obj,
+                         f"orphan structure {obj} has no readable type; "
+                         "not freeing")
+
+    # ---- driver ----
+
+    def run(self):
+        mos = self.src.get(MOS_DIR_OBJ)
+        if not mos.readable:
+            self.add("CRITICAL", MOS_DIR_OBJ,
+                     "MOS directory (object 1) missing or unreadable — "
+                     "beyond this tool; label/uberblock-level recovery "
+                     "needed")
+            return
+        self.check_errlog(mos)
+        self.check_scan(mos)
+        root = mos.zap.get("root_dataset", 0)
+        if root:
+            self.walk_dsl_dir(root, "<root>")
+        else:
+            self.add("CRITICAL", MOS_DIR_OBJ,
+                     "MOS directory has no root_dataset entry")
+
+
+def dedupe_ops(ops):
+    seen, out = set(), []
+    for op in ops:
+        if op.line not in seen:
+            seen.add(op.line)
+            out.append(op)
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="zhaxx-scan",
+        description="Read-only MOS referential-integrity scanner")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--pool", help="pool name (runs zdb)")
+    src.add_argument("--dumps", help="directory of saved obj_<N>.txt dumps")
+    ap.add_argument("--zdb", default="zdb", help="zdb binary (default: zdb)")
+    ap.add_argument("--cachefile", help="pass to zdb as -U")
+    ap.add_argument("--exported", action="store_true",
+                    help="pool is exported (pass -e to zdb)")
+    ap.add_argument("--capture", metavar="DIR",
+                    help="save every zdb dump to DIR (pre-surgery backup)")
+    ap.add_argument("--plan", metavar="FILE",
+                    help="write repair plan for the zhaxx surgeon")
+    ap.add_argument("--json", metavar="FILE", help="write JSON report")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    if args.pool:
+        source = ZdbSource(args.pool, zdb=args.zdb, cachefile=args.cachefile,
+                           exported=args.exported, capture=args.capture)
+    else:
+        if not os.path.isdir(args.dumps):
+            sys.exit(f"zhaxx-scan: not a directory: {args.dumps}")
+        source = DumpDirSource(args.dumps)
+
+    sc = Scanner(source, verbose=args.verbose)
+    sc.run()
+    findings = sorted(sc.findings, key=lambda f: (SEV_ORDER[f.severity],
+                                                  f.obj))
+    ops = dedupe_ops(sc.ops)
+
+    print("zhaxx-scan report")
+    print("=" * 64)
+    if not findings:
+        print("  no findings — MOS namespace is referentially consistent")
+    for f in findings:
+        print(f"  [{f.severity}] obj {f.obj}: {f.message}")
+    n_crit = sum(1 for f in findings if f.severity == "CRITICAL")
+    print("-" * 64)
+    print(f"  {len(findings)} finding(s), {n_crit} critical, "
+          f"{len(ops)} planned operation(s)")
+
+    if ops:
+        print("\nproposed repair operations:")
+        for op in ops:
+            print(f"  {op.line:<60}  # {op.comment}")
+
+    if args.plan:
+        with open(args.plan, "w") as f:
+            f.write("# zhaxx repair plan — generated by zhaxx-scan\n")
+            f.write("# REVIEW EVERY LINE against the report before use.\n")
+            f.write("# Every op re-verifies its expect= precondition "
+                    "atomically before any write.\n")
+            for op in ops:
+                f.write(f"# {op.comment}\n{op.line}\n")
+        print(f"\nplan written: {args.plan}")
+
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump({"findings": [x.as_dict() for x in findings],
+                       "plan": [op.line for op in ops]}, f, indent=2)
+
+    sys.exit(1 if findings else 0)
+
+
+if __name__ == "__main__":
+    main()

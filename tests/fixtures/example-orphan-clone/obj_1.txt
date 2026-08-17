@@ -1,0 +1,8 @@
+Dataset mos [META], ID 0, cr_txg 4, 1.00G, 1000 objects
+
+    Object  lvl   iblk   dblk  dsize  dnsize  lsize   %full  type
+    1    1   128K    512    12K     512    512  100.00  object directory
+		root_dataset = 32 
+		errlog_scrub = 0 
+		errlog_last = 910 
+		scan = 2 1 999 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 

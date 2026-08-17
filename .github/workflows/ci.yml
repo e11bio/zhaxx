@@ -1,0 +1,40 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  scan-offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: scanner offline tests (no ZFS, no root)
+        run: python3 tests/test_scan.py
+
+  surgeon-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04 }   # ZFS 2.1.x
+          - { os: ubuntu-24.04 }   # ZFS 2.2.x
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install ZFS headers + libzpool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libzfslinux-dev zfsutils-linux || \
+          sudo apt-get install -y zfs-dkms libnvpair3linux libuutil3linux
+      - name: locate a ZFS source/header tree
+        run: |
+          ls -d /usr/src/zfs-* 2>/dev/null || true
+          dpkg -L libzfslinux-dev 2>/dev/null | grep include || true
+      - name: build surgeon (best-effort across distro ZFS versions)
+        run: |
+          # The surgeon links the distro libzpool; header layout drifts across
+          # 2.1/2.2/2.3. A build failure here flags an API break to port.
+          surgeon/build.sh || {
+            echo "::warning::surgeon build failed on ${{ matrix.os }} — "\
+                 "likely a libzpool API drift to port"; exit 0; }

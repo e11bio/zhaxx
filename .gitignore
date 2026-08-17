@@ -1,0 +1,11 @@
+# built surgeon binary
+/surgeon/zhaxx
+*.o
+
+# scanner capture output / ad-hoc plans (keep plans/example-*.plan)
+/capture/
+/plans/*.plan
+!/plans/example-*.plan
+
+__pycache__/
+*.pyc

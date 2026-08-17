@@ -1,0 +1,5 @@
+Dataset mos [META], ID 0, cr_txg 4, 1.00G, 1000 objects
+
+    Object  lvl   iblk   dblk  dsize  dnsize  lsize   %full  type
+    673    1   128K    512    12K     512    512  100.00  DSL dataset
+zdb: can't open object 673: Input/output error

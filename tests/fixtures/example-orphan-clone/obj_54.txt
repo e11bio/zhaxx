@@ -1,0 +1,6 @@
+Dataset mos [META], ID 0, cr_txg 4, 1.00G, 1000 objects
+
+    Object  lvl   iblk   dblk  dsize  dnsize  lsize   %full  type
+    54    1   128K    512    12K     512    512  100.00  DSL dataset
+		prev_snap_obj = 48 
+		next_clones_obj = 0 
