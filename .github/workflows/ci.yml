@@ -33,8 +33,9 @@ jobs:
           dpkg -L libzfslinux-dev 2>/dev/null | grep include || true
       - name: build surgeon (best-effort across distro ZFS versions)
         run: |
-          # The surgeon links the distro libzpool; header layout drifts across
-          # 2.1/2.2/2.3. A build failure here flags an API break to port.
+          # Non-fatal: the surgeon targets the ZFS 2.2 libzpool API; older/newer
+          # distro versions (2.1/2.3) may need porting. A failure here surfaces
+          # the compiler output to triage, without blocking the scanner check.
           surgeon/build.sh || {
             echo "::warning::surgeon build failed on ${{ matrix.os }} — "\
-                 "likely a libzpool API drift to port"; exit 0; }
+                 "see the build step output above"; exit 0; }

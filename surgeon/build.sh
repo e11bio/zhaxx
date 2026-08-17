@@ -26,18 +26,49 @@ detect_zfs_version() {
 	zfs version 2>/dev/null | head -1 | sed 's/^zfs-//'
 }
 
-if [[ -z "${ZFS_SRC:-}" ]]; then
+# Two supported header layouts:
+#   source-tree  : a DKMS/source checkout ($ZFS_SRC/include/sys). Uses the
+#                  vendored compat/ libspl shims. This is the appliance case.
+#   dev-package  : distro -dev headers (/usr/include/libzfs + /usr/include/libspl),
+#                  which ship their own libspl — the vendored compat/ is skipped.
+INCLUDES=()      # -I flags, in order
+HDR_LABEL=""     # human label for the version sanity check
+
+if [[ -n "${ZFS_SRC:-}" ]]; then
+	[[ -d "$ZFS_SRC/include/sys" ]] || \
+		fail "ZFS_SRC=$ZFS_SRC has no include/sys"
+	INCLUDES=(-I"$here/compat" -I"$here/compat/os/linux" \
+		-I"$ZFS_SRC/include")
+	HDR_LABEL="$(basename "$ZFS_SRC" | sed 's/^zfs-//')"
+else
 	want="$(detect_zfs_version || true)"
-	for c in \
-		${want:+/usr/src/zfs-${want}} \
-		/usr/src/zfs-*/ \
-		/usr/src/zfs \
-		./zfs; do
-		if [[ -d "$c/include/sys" ]]; then ZFS_SRC="$c"; break; fi
+	# source-tree autodetect
+	for c in ${want:+/usr/src/zfs-${want}} /usr/src/zfs-*/ /usr/src/zfs \
+	    ./zfs; do
+		if [[ -d "$c/include/sys" ]]; then
+			ZFS_SRC="$c"
+			INCLUDES=(-I"$here/compat" -I"$here/compat/os/linux" \
+				-I"$c/include")
+			HDR_LABEL="$(basename "$c" | sed 's/^zfs-//')"
+			break
+		fi
 	done
+	# dev-package autodetect (headers ship their own libspl)
+	if [[ ${#INCLUDES[@]} -eq 0 ]]; then
+		for inc in /usr/include /usr/local/include; do
+			if [[ -d "$inc/libzfs/sys" && -d "$inc/libspl" ]]; then
+				INCLUDES=(-I"$inc/libspl" \
+					-I"$inc/libspl/os/linux" \
+					-I"$inc/libzfs")
+				HDR_LABEL="${want:-dev-package}"
+				break
+			fi
+		done
+	fi
 fi
-[[ -n "${ZFS_SRC:-}" && -d "$ZFS_SRC/include/sys" ]] || \
-	fail "no ZFS source tree found; set ZFS_SRC=/usr/src/zfs-<ver>"
+[[ ${#INCLUDES[@]} -gt 0 ]] || fail \
+	"no ZFS headers found: set ZFS_SRC=/usr/src/zfs-<ver>, or install the "\
+"distro -dev package (Debian/Ubuntu: libzfslinux-dev)"
 
 # --- locate libzpool ---
 if [[ -z "${LIBDIR:-}" ]]; then
@@ -61,30 +92,26 @@ L_UUTIL="$(soname libuutil)"
 L_ZFSCORE="$(soname libzfs_core)"
 
 # --- version sanity: headers vs library ---
-hdr_ver="$(basename "$ZFS_SRC" | sed 's/^zfs-//')"
-lib_ver="${L_ZPOOL#libzpool.so.}"
-echo "ZFS source : $ZFS_SRC  (label: $hdr_ver)"
+echo "ZFS headers: ${ZFS_SRC:-distro -dev}  (label: $HDR_LABEL)"
 echo "libzpool   : $LIBDIR/$L_ZPOOL"
-if [[ -n "$(detect_zfs_version || true)" ]]; then
+if [[ -n "$(detect_zfs_version || true)" && "$HDR_LABEL" != "dev-package" ]]; then
 	live="$(detect_zfs_version)"
-	case "$hdr_ver" in
+	case "$HDR_LABEL" in
 	"$live"*) : ;;
-	*) echo "WARNING: source tree ($hdr_ver) != live zfs ($live). The" >&2
+	*) echo "WARNING: headers ($HDR_LABEL) != live zfs ($live). The" >&2
 	   echo "         surgeon MUST match the version that owns the pool." >&2;;
 	esac
 fi
 
 echo "=== compiling zhaxx ==="
-# Include order: vendored compat (userspace libspl shims) first, then the
-# ZFS source headers. -include stdint.h forces fixed-width types ahead of
-# stdlib.h. We deliberately do NOT include the kernel-space os/linux/{spl,zfs}
-# trees — compat/ replaces them for userspace.
+# -include stdint.h forces fixed-width types ahead of stdlib.h. -DLIB_ZPOOL_BUILD
+# selects the userspace (libzpool) code paths in the ZFS headers. The kernel-space
+# os/linux/{spl,zfs} trees are deliberately excluded; libspl (vendored compat/ or
+# the distro's /usr/include/libspl) replaces them for userspace.
 set -x
 "$CC" -o "$here/zhaxx" "$here/zhaxx.c" \
 	-include stdint.h \
-	-I"$here/compat" \
-	-I"$here/compat/os/linux" \
-	-I"$ZFS_SRC/include" \
+	"${INCLUDES[@]}" \
 	-D_GNU_SOURCE \
 	-DLIB_ZPOOL_BUILD \
 	-Wall \
