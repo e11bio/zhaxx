@@ -62,7 +62,9 @@ two header layouts, autodetected or set via `ZFS_SRC=` / `LIBDIR=` / `CC=`:
   for the exact steps CI uses to fetch a matching one).
 
 The surgeon must be built against the **same ZFS version that owns the pool**;
-the on-disk format interpretation comes from that libzpool.
+the on-disk format interpretation comes from that libzpool. It targets the ZFS
+**2.2.x** API (CI builds it there); the vendored `compat/` is 2.2-era, so other
+versions need matching libspl compat headers before they will build.
 
 ## Plan format
 

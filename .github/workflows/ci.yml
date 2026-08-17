@@ -17,9 +17,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04 }   # ZFS 2.1.x
-          - { os: ubuntu-24.04 }   # ZFS 2.2.x
+          # 2.2 is the target API (incident pool = 2.2.6) — must build.
+          - { os: ubuntu-24.04, required: true }   # ZFS 2.2.x
+          # Other versions are a drift signal: the vendored compat/ libspl is
+          # 2.2-era, so a mismatched header tree is expected to fail until
+          # per-version compat headers are added. Non-blocking.
+          - { os: ubuntu-22.04, required: false }  # ZFS 2.1.x
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ !matrix.required }}
     steps:
       - uses: actions/checkout@v4
       - name: install runtime libzpool + build deps
@@ -50,10 +55,4 @@ jobs:
           test -f "zfs-$v/include/sys/zfs_ioctl.h"
           echo "ZFS_SRC=$PWD/zfs-$v" >> "$GITHUB_ENV"
       - name: build surgeon
-        run: |
-          # Non-fatal across the 2.1/2.2/2.3 matrix: the surgeon targets the
-          # 2.2 libzpool API; a failure surfaces the compiler output to triage
-          # without blocking the scanner check.
-          surgeon/build.sh || {
-            echo "::warning::surgeon build failed on ${{ matrix.os }} — "\
-                 "see the build step output above"; exit 0; }
+        run: surgeon/build.sh
