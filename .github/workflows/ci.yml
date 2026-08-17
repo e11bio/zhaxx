@@ -34,11 +34,20 @@ jobs:
             libtirpc-dev zlib1g-dev
       - name: fetch matching OpenZFS source tree (headers)
         run: |
-          v="$(zfs version | sed -n '1s/^zfs-\([0-9][0-9.]*\).*/\1/p')"
-          echo "matching OpenZFS release: $v"
+          set -euo pipefail
+          # Derive the upstream version from the installed libzpool package
+          # (no dependency on the zfs CLI being present).
+          pkg="$(dpkg-query -W -f='${binary:Package}\n' 'libzpool*linux' \
+            | head -1)"
+          ver="$(dpkg-query -W -f='${Version}' "$pkg")"
+          v="$(printf '%s' "$ver" | sed -n 's/^\([0-9][0-9.]*\).*/\1/p')"
+          echo "libzpool package=$pkg version=$ver -> OpenZFS $v"
+          test -n "$v"
           curl -fsSL \
             "https://github.com/openzfs/zfs/releases/download/zfs-$v/zfs-$v.tar.gz" \
-            | tar xz
+            -o src.tar.gz
+          tar xzf src.tar.gz
+          test -f "zfs-$v/include/sys/zfs_ioctl.h"
           echo "ZFS_SRC=$PWD/zfs-$v" >> "$GITHUB_ENV"
       - name: build surgeon
         run: |
