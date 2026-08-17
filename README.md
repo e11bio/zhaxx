@@ -47,12 +47,19 @@ scan/zhaxx-scan --pool POOL --exported
 
 ## Building the surgeon
 
-`surgeon/build.sh` autodetects the ZFS source tree (`/usr/src/zfs-*`) and
-`libzpool.so`, checks the header version against the live `zfs version`, and
-links by soname — no dev symlinks in `/usr/lib`. Override with `ZFS_SRC=`,
-`LIBDIR=`, `CC=`. The vendored `surgeon/compat/` headers are the OpenZFS
-userspace libspl shims, so the build needs only a source/header tree plus the
-runtime `libzpool`, not a full ZFS build.
+`surgeon/build.sh` links by soname (no dev symlinks in `/usr/lib`) and supports
+two header layouts, autodetected or set via `ZFS_SRC=` / `LIBDIR=` / `CC=`:
+
+- **Source tree** (`/usr/src/zfs-*`, a git checkout, or a release tarball) —
+  the supported path. The vendored `surgeon/compat/` headers supply the libspl
+  userspace shims, so the build needs only the ZFS header sources plus the
+  runtime `libzpool` — no `./configure`, no full ZFS build. This is the
+  appliance layout.
+- **Distro `-dev` package** (`/usr/include/libzfs` + `/usr/include/libspl`) —
+  a convenience. Note that some distributions (e.g. Ubuntu `libzfslinux-dev`)
+  ship internal headers that reference `sys/zfs_ioctl.h` without shipping it;
+  when that build fails, use a source tree instead (see `.github/workflows/`
+  for the exact steps CI uses to fetch a matching one).
 
 The surgeon must be built against the **same ZFS version that owns the pool**;
 the on-disk format interpretation comes from that libzpool.

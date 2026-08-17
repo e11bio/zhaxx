@@ -22,20 +22,29 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: install ZFS headers + libzpool
+      - name: install runtime libzpool + build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y libzfslinux-dev zfsutils-linux || \
-          sudo apt-get install -y zfs-dkms libnvpair3linux libuutil3linux
-      - name: locate a ZFS source/header tree
+          # libzfslinux-dev provides the runtime libs (libzpool/libnvpair/...)
+          # and linker dev symlinks. Its internal headers are incomplete for an
+          # out-of-tree build (they reference sys/zfs_ioctl.h, which the package
+          # does not ship), so headers come from a matching OpenZFS source tree
+          # instead — the supported build path, same as on the appliance.
+          sudo apt-get install -y libzfslinux-dev uuid-dev libblkid-dev \
+            libtirpc-dev zlib1g-dev
+      - name: fetch matching OpenZFS source tree (headers)
         run: |
-          ls -d /usr/src/zfs-* 2>/dev/null || true
-          dpkg -L libzfslinux-dev 2>/dev/null | grep include || true
-      - name: build surgeon (best-effort across distro ZFS versions)
+          v="$(zfs version | sed -n '1s/^zfs-\([0-9][0-9.]*\).*/\1/p')"
+          echo "matching OpenZFS release: $v"
+          curl -fsSL \
+            "https://github.com/openzfs/zfs/releases/download/zfs-$v/zfs-$v.tar.gz" \
+            | tar xz
+          echo "ZFS_SRC=$PWD/zfs-$v" >> "$GITHUB_ENV"
+      - name: build surgeon
         run: |
-          # Non-fatal: the surgeon targets the ZFS 2.2 libzpool API; older/newer
-          # distro versions (2.1/2.3) may need porting. A failure here surfaces
-          # the compiler output to triage, without blocking the scanner check.
+          # Non-fatal across the 2.1/2.2/2.3 matrix: the surgeon targets the
+          # 2.2 libzpool API; a failure surfaces the compiler output to triage
+          # without blocking the scanner check.
           surgeon/build.sh || {
             echo "::warning::surgeon build failed on ${{ matrix.os }} — "\
                  "see the build step output above"; exit 0; }
